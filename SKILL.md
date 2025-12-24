@@ -5,442 +5,159 @@ description: "Git-native project memory system for storing and retrieving projec
 
 # Membase: Git-Native Project Memory
 
-**TL;DR:** Store project decisions and context with `scripts/mb add`, retrieve with `scripts/mb query`, maintain consistency across sessions.
+**TL;DR:** Store project decisions with `scripts/mb add`, retrieve with `scripts/mb query`, maintain consistency across sessions.
 
-## What is Membase?
+Membase is a git-native project memory system that stores project knowledge in simple text files (`.membase/`). It uses multi-dimensional tagging (topic + phase) to organize information and enables efficient context retrieval across sessions.
 
-Membase is a git-native project memory system that stores project knowledge in simple text files (`.membase/`). It uses multi-dimensional tagging to organize information and enables efficient context retrieval across sessions.
-
-**Core principle:** Store decisions and context so they're never lost between sessions. Retrieve them when needed to avoid re-solving problems or contradicting earlier decisions.
+**Core principle:** Store decisions and context so they're never lost between sessions. Query before implementing to avoid contradicting earlier decisions.
 
 ## Quick Start
 
 ```bash
-# Initialize membase in your project
+# Initialize membase
 scripts/mb init
 
-# Add your first topic
+# Add a topic for your project
 scripts/mb dims add topic authentication
 
 # Store a decision
-scripts/mb add -s "JWT auth with 24h expiry" \
-  -c "Using JWT for stateless authentication. Tokens expire in 24h." \
+scripts/mb add \
+  -s "JWT auth with 24h expiry" \
+  -c "Using JWT for stateless authentication. Tokens expire in 24h. Refresh tokens valid 7 days." \
   topic=authentication phase=decision
 
-# Query decisions before implementing
+# Query before implementing
 scripts/mb query --topic authentication --phase decision
 ```
 
-## When to Store Memories
+## When to Use Membase
 
-Proactively store memories using `scripts/mb add` when:
+### Store memories when:
+- **Design decisions are made** (architecture, technology choices, patterns)
+- **Implementation approaches are chosen** (algorithms, data structures)
+- **Gotchas are discovered** (edge cases, framework quirks, workarounds)
+- **User states preferences** (requirements, coding style)
+- **Key patterns are established** (file locations, naming conventions)
 
-1. **Design decisions are made**
-   - Architecture choices (REST vs GraphQL, state management approach)
-   - Technology selections (database choice, library decisions)
-   - Pattern decisions (error handling strategy, testing approach)
-
-2. **Implementation approaches are chosen**
-   - Algorithm selections
-   - Data structure decisions
-   - Integration patterns
-
-3. **Gotchas or workarounds are discovered**
-   - Edge cases handled in specific ways
-   - Framework quirks or limitations
-   - Performance optimizations
-
-4. **User states preferences or requirements**
-   - Explicit project requirements
-   - Coding style preferences
-   - Workflow preferences
-
-5. **Key file locations or patterns are established**
-   - Where specific types of code live
-   - Naming conventions
-   - Module organization patterns
-
-## When to Retrieve Memories
-
-Query memories using `scripts/mb query` when:
-
-1. **Starting work on a topic**
-   - Check what's already decided before implementing
-   - Understand context from previous sessions
-   - Avoid contradicting earlier decisions
-
-2. **User asks about previous decisions**
-   - "What did we decide about authentication?"
-   - "Why did we choose PostgreSQL?"
-   - "How is error handling implemented?"
-
-3. **Implementing something that might have prior context**
-   - Before adding a new feature in an existing area
-   - When uncertain about existing patterns
-   - To maintain consistency with earlier work
-
-4. **Debugging or troubleshooting**
-   - Check if similar issues were encountered before
-   - Review relevant implementation decisions
-   - Understand context around problematic code
+### Retrieve memories when:
+- **Starting work on a topic** (check existing decisions first)
+- **User asks about previous decisions** ("What did we decide about X?")
+- **Implementing with potential context** (maintain consistency)
+- **Debugging or troubleshooting** (check for known issues)
 
 ## Multi-Dimensional Tagging
 
-Membase organizes memories with two dimensions:
+Organize memories with two dimensions:
 
-### 1. topic (Project-specific subject areas)
-
-Define topics based on your project's architecture. Common examples:
-
-- `authentication` - Auth mechanisms, session management, tokens
-- `database` - Schema, migrations, ORM choices
-- `api` - Endpoints, REST/GraphQL decisions, versioning
-- `frontend` - UI frameworks, state management, routing
-- `deployment` - CI/CD, hosting, infrastructure
-
-Add topics as needed:
+**topic** - Project-specific areas you define:
 ```bash
 scripts/mb dims add topic authentication
 scripts/mb dims add topic database
+scripts/mb dims add topic api
 ```
 
-### 2. phase (Workflow stage)
+**phase** - Workflow stage (pre-populated):
+- `decision` - Architectural/design decisions ⭐ **Most important**
+- `backend-implementation` - Backend code details
+- `frontend-implementation` - Frontend code details
+- `troubleshooting` - Known issues and solutions
+- `planning`, `requirements`, `testing`, `documentation`, `deployment`
 
-Pre-populated with defaults to track the decision lifecycle:
+## Common Patterns
 
-- `requirements` - User requirements and specifications
-- `decision` - Architectural or design decisions ⭐ **Most important**
-- `planning` - Implementation planning notes
-- `backend-implementation` - Backend code details and locations
-- `frontend-implementation` - Frontend code details and locations
-- `testing` - Testing strategies and test details
-- `documentation` - Documentation notes and patterns
-- `troubleshooting` - Known issues and their solutions
-- `deployment` - Deployment configurations and notes
-
-**Custom dimensions:**
-```bash
-scripts/mb dims add-dim priority "Task priority level"
-scripts/mb dims add priority high
-scripts/mb dims add priority critical
-```
-
-## Common Usage Patterns
-
-### Pattern 1: Recording Architectural Decisions
-
-When making technology or architecture choices:
-
+**Record a decision:**
 ```bash
 scripts/mb add \
   -s "PostgreSQL for main database" \
-  -c "Chose PostgreSQL over MySQL for better JSON support and PostGIS if needed later. Using SQLAlchemy as ORM. Connection pool sized at 10-20 based on expected load." \
+  -c "Chose PostgreSQL over MySQL for JSON support. Using SQLAlchemy ORM." \
   topic=database phase=decision
 ```
 
-### Pattern 2: Documenting Implementation Details
+**Query before implementing:**
+```bash
+scripts/mb query --topic database --phase decision
+scripts/mb query --search "PostgreSQL"
+```
 
-When implementing features:
-
+**Document implementation:**
 ```bash
 scripts/mb add \
   -s "User model in src/models/user.py" \
-  -c "User model includes: username, email, password_hash, created_at, updated_at. Email is unique. Passwords hashed with bcrypt (12 rounds). Includes methods for password verification and token generation." \
+  -c "Fields: username, email, password_hash. Email is unique. Bcrypt with 12 rounds." \
   topic=authentication phase=backend-implementation
 ```
 
-### Pattern 3: Capturing Gotchas and Edge Cases
-
-When discovering important edge cases:
-
+**Capture gotchas:**
 ```bash
 scripts/mb add \
-  -s "API rate limiting uses Redis with sliding window" \
-  -c "Implemented sliding window rate limiting in src/middleware/ratelimit.py. Key: 'ratelimit:user:{id}:{endpoint}'. Window: 60 seconds. Limit: 100 requests. IMPORTANT: Must call redis.expire() after incrementing to prevent memory leak." \
+  -s "Redis rate limiting memory leak fix" \
+  -c "IMPORTANT: Must call redis.expire() after incrementing counter to prevent leak." \
   topic=api phase=troubleshooting
-```
-
-### Pattern 4: Querying Before Implementing
-
-Before starting implementation:
-
-```bash
-# Check all decisions for a topic
-scripts/mb query --topic authentication --phase decision
-
-# Search for specific keywords
-scripts/mb query --search "JWT"
-
-# Get full context on a specific memory
-scripts/mb query --id abc12345
-```
-
-### Pattern 5: Team Workflow Integration
-
-Membase works naturally with git:
-
-```bash
-# After adding memories during development
-git add .membase/
-git commit -m "Document authentication decisions"
-git push
-
-# Team members get memories automatically
-git pull  # Receives shared project context
 ```
 
 ## Best Practices
 
-### What to Store
+**Writing summaries** (≤100 chars):
+- ✓ Specific: "JWT auth with 24h expiry and refresh tokens"
+- ✗ Vague: "Authentication stuff"
 
-**DO store:**
-- Decisions with rationale (the "why" behind choices)
-- Implementation patterns and conventions
-- Known limitations and workarounds
-- File locations and organization patterns
-- Configuration choices and their reasoning
-- Integration details and API contracts
-
-**DON'T store:**
-- Code snippets (git is for code)
-- Trivial decisions (e.g., "added a comment")
-- Temporary notes or WIP thoughts
-- Information that changes frequently
-
-### Writing Effective Summaries
-
-Summaries appear in listings—make them scannable and specific:
-
-```bash
-# ✓ Good: Specific and clear
--s "JWT auth with 24h expiry and refresh tokens"
-
-# ✗ Bad: Vague
--s "Authentication stuff"
-
-# ✓ Good: Identifies location
--s "Rate limiting middleware in src/middleware/ratelimit.py"
-
-# ✗ Bad: No location context
--s "Rate limiting"
-```
-
-**Summary guidelines:**
-- Maximum 100 characters
-- Include key details (technology, file location, or main concept)
-- Use consistent terminology
-- Front-load important information
-
-### Writing Effective Content
-
-Content provides context for future sessions—include the "why" and "how":
-
-```bash
-# ✓ Good: Includes rationale and details
--c "Chose JWT over sessions because the API needs to be stateless for horizontal scaling. Access tokens expire in 24h, refresh tokens in 7 days. Stored in HTTP-only cookies to prevent XSS. Implementation in src/auth/jwt.py uses PyJWT library."
-
-# ✗ Bad: No context
--c "Using JWT for auth"
-```
-
-**Content guidelines:**
-- Explain the reasoning behind decisions
-- Include relevant file paths
-- Mention alternatives considered
-- Note any important constraints or trade-offs
+**Writing content**:
+- Include the "why" behind decisions
+- Mention file paths and locations
+- Note alternatives considered
 - Add specific configuration values
 
-### Consistent Tagging Strategy
-
-Use tags systematically to make queries predictable:
-
+**Tagging consistently**:
 ```bash
-# Decision about authentication
-topic=authentication phase=decision
-
-# Implementation of authentication
-topic=authentication phase=backend-implementation
-
-# Problem and solution with authentication
-topic=authentication phase=troubleshooting
-```
-
-## Workflow Integration
-
-### Session Start
-
-Begin coding sessions by reviewing context:
-
-```bash
-# Review recent work
-scripts/mb query --limit 10
-
-# Check relevant area
-scripts/mb query --topic <area-you-are-working-on>
-
-# View project coverage
-scripts/mb stats
-```
-
-### During Implementation
-
-Integrate membase into your development flow:
-
-```bash
-# BEFORE implementing: Check for existing decisions
-scripts/mb query --topic <area> --phase decision
-
-# AFTER deciding: Store the decision
-scripts/mb add -s "..." -c "..." topic=<area> phase=decision
-
-# AFTER implementing: Document key details
-scripts/mb add -s "..." -c "..." topic=<area> phase=backend-implementation
-
-# WHEN troubleshooting: Check for known issues
-scripts/mb query --topic <area> --phase troubleshooting
-```
-
-### Session End
-
-Capture any final insights:
-
-```bash
-# Store discoveries made during implementation
-scripts/mb add -s "..." -c "..." <tags>
-
-# Verify important items were captured
-scripts/mb stats
+topic=authentication phase=decision         # Design decision
+topic=authentication phase=backend-implementation  # Implementation
+topic=authentication phase=troubleshooting  # Problem/solution
 ```
 
 ## Claude Code Integration
 
-**For Claude Code:**
+**For Claude:** Proactively use membase by:
 
-### When to Proactively Store
+1. **Query before implementing** - Check `scripts/mb query --topic <area> --phase decision`
+2. **Store after deciding** - Suggest storing significant decisions
+3. **Maintain consistency** - Reference stored decisions (mention memory ID)
+4. **Update when needed** - Suggest edits if decisions change
 
-Store memories automatically when:
-- A significant decision is made during conversation
-- Implementation patterns are established
-- Gotchas or workarounds are discovered
-- User states explicit preferences
-
-### When to Proactively Retrieve
-
-Query memories before:
-- Starting work on a new feature
-- Making architectural decisions
-- Implementing in an area that might have context
-- Answering questions about previous decisions
-
-### Example Interaction
-
+**Example workflow:**
 ```
 User: "Let's add user authentication"
-
-Claude: "Let me check if there are any existing decisions about authentication."
+Claude: "Let me check existing decisions..."
 [Runs: scripts/mb query --topic authentication --phase decision]
-
-Claude: "I found a previous decision to use JWT auth with 24h expiry.
-I'll implement following this pattern..."
+Claude: "Found JWT auth decision (memory abc12345). I'll follow that pattern..."
 ```
 
-### Maintaining Consistency
-
-1. **Always check membase before architectural decisions**
-2. **Reference stored decisions when relevant** (mention memory ID)
-3. **Suggest updating memories** when decisions change
-4. **Proactively store new decisions** after user approval
-
-## Examples
-
-### Example 1: API Design Decision
-
-```bash
-scripts/mb add \
-  -s "REST API using Flask-RESTful" \
-  -c "Chose REST over GraphQL for simplicity and team familiarity. Using Flask-RESTful for routing. API versioning via URL path (/api/v1/...). JSON responses with standardized error format: {\"error\": {\"code\": \"...\", \"message\": \"...\"}}. Error codes follow HTTP status codes." \
-  topic=api phase=decision
-```
-
-### Example 2: Database Schema Documentation
-
-```bash
-scripts/mb add \
-  -s "Orders table schema in migrations/002_orders.sql" \
-  -c "Orders table includes: id (UUID), user_id (FK to users), status (enum: pending/processing/completed/cancelled), total_amount (decimal 10,2), created_at, updated_at. Composite index on (user_id, status) for dashboard queries. Status transitions logged in order_history table." \
-  topic=database phase=backend-implementation
-```
-
-### Example 3: Troubleshooting Discovery
-
-```bash
-scripts/mb add \
-  -s "Fix for race condition in order processing" \
-  -c "Discovered race condition when multiple workers processed same order simultaneously. Fixed by adding SELECT FOR UPDATE in src/workers/order_processor.py:45. Also added unique constraint on orders.processing_lock_id to prevent duplicates. Workers now retry with exponential backoff on lock contention." \
-  topic=api phase=troubleshooting
-```
-
-### Example 4: Frontend Pattern
-
-```bash
-scripts/mb add \
-  -s "Form validation using Formik + Yup" \
-  -c "Standardized on Formik for form handling and Yup for validation schemas across all forms. Pattern: Create schema in src/validation/schemas/, import and use in components with useFormik hook. See src/components/LoginForm.tsx for reference implementation. Validation runs on blur and submit." \
-  topic=frontend phase=frontend-implementation
-```
-
-### Example 5: Deployment Configuration
-
-```bash
-scripts/mb add \
-  -s "Production deployment on AWS ECS Fargate" \
-  -c "Deploying via AWS ECS Fargate with auto-scaling (min 2, max 10 tasks). Load balancer health checks on /health endpoint every 30s. Environment variables managed via AWS Parameter Store. Database credentials rotated via Secrets Manager. CI/CD pipeline defined in .github/workflows/deploy.yml triggers on main branch pushes." \
-  topic=deployment phase=deployment
-```
-
-## Tips
-
-- **Start simple**: Begin with 3-5 core topics, expand as needed
-- **Be specific**: Detailed summaries make memories discoverable
-- **Tag consistently**: Consistent tagging improves query effectiveness
-- **Review regularly**: `scripts/mb stats` shows coverage gaps
-- **Update when needed**: `scripts/mb edit <id>` keeps info current
-- **Delete when obsolete**: `scripts/mb delete <id>` removes outdated info
-- **Search liberally**: `scripts/mb query --search` is powerful for keywords
-
-## Command Reference
+## Essential Commands
 
 ```bash
 # Initialize
 scripts/mb init
 
 # Add memory
-scripts/mb add -s "summary" -c "content" dim=val [dim=val...]
+scripts/mb add -s "summary" -c "content" topic=X phase=Y
 
 # Query
-scripts/mb query [--topic val] [--phase val] [--search "text"]
-scripts/mb query --id <prefix>
+scripts/mb query --topic X --phase Y
+scripts/mb query --search "keyword"
+scripts/mb query --id abc123
 scripts/mb query --all
-scripts/mb query --json         # JSON output
-scripts/mb query --full          # Force detailed view
-scripts/mb query --brief         # Force summary view
-scripts/mb query --limit N       # Limit results (default: 50)
 
-# Dimensions
-scripts/mb dims                          # List all
-scripts/mb dims add <dimension> <value>  # Add value to dimension
-scripts/mb dims add-dim <name> [desc]    # Create new dimension
-
-# Edit
-scripts/mb edit <id> [-s "new summary"] [-c "new content"] [dim=val...]
-
-# Delete
-scripts/mb delete <id> [-y]              # -y skips confirmation
+# Manage dimensions
+scripts/mb dims                    # List all
+scripts/mb dims add topic <name>   # Add topic value
 
 # Stats
-scripts/mb stats                         # Show memory counts by dimension
+scripts/mb stats
 ```
+
+## Advanced Usage
+
+For detailed examples, advanced commands, workflow integration, and tips, see [REFERENCE.md](REFERENCE.md).
 
 ---
 
-**Remember:** Membase keeps your project context alive across sessions, ensuring decisions aren't lost and patterns stay consistent. Query before implementing, store after deciding.
+**Remember:** Query before implementing, store after deciding. Membase keeps context alive across sessions.
