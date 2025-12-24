@@ -121,9 +121,16 @@ def atomic_write(path: Path, content: str) -> None:
         IOError: If write fails
         OSError: If rename fails
     """
-    temp_path = path.with_suffix('.tmp')
+    import tempfile
+    # Use unique temp filename to avoid race conditions in concurrent access
+    temp_fd, temp_path_str = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f'.{path.name}.',
+        suffix='.tmp'
+    )
+    temp_path = Path(temp_path_str)
     try:
-        with open(temp_path, 'w', encoding='utf-8') as f:
+        with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())  # Force kernel to flush to disk
@@ -540,10 +547,41 @@ def cmd_add(args: argparse.Namespace) -> None:
         "created_at": now_iso()
     }
 
-    # Save
-    memories = load_memories()
-    memories.append(memory)
-    save_memories(memories)
+    # Save with exclusive lock for entire read-modify-write cycle
+    _, _, memories_path = get_membase_paths()
+    try:
+        # Open file with exclusive lock for entire transaction
+        with open(memories_path, 'r+', encoding='utf-8') as f:
+            acquire_file_lock(f, exclusive=True)
+
+            # Read current memories
+            memories = []
+            for line in f:
+                line = line.strip()
+                if line:
+                    memories.append(json.loads(line))
+
+            # Add new memory
+            memories.append(memory)
+
+            # Sort by UUID
+            memories.sort(key=lambda m: m["id"])
+
+            # Write back to the same file (while holding lock)
+            f.seek(0)
+            f.truncate()
+            for mem in memories:
+                f.write(json.dumps(mem, separators=(',', ':'), ensure_ascii=False))
+                f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+
+    except FileNotFoundError:
+        # File doesn't exist yet, just save
+        save_memories([memory])
+    except (IOError, OSError) as e:
+        error(f"Failed to add memory: {e}")
+        sys.exit(1)
 
     success(f"Added memory {memory['id'][:ID_DISPLAY_LENGTH]}")
 
