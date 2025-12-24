@@ -1,0 +1,900 @@
+#!/usr/bin/env python3
+"""
+Membase - Git-native project memory system for Claude Code.
+
+A simple, git-friendly project memory system that stores decisions,
+implementation notes, and documentation with multi-dimensional tagging.
+"""
+
+import argparse
+import difflib
+import fcntl
+import json
+import os
+import re
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+
+# Version
+VERSION = "1.0.0"
+
+# Constants
+MEMBASE_DIR = ".membase"
+SCHEMA_FILE = "schema.json"
+MEMORIES_FILE = "memories.jsonl"
+CURRENT_SCHEMA_VERSION = 1
+
+# Validation constants
+MAX_SUMMARY_LENGTH = 100
+MAX_CONTENT_LENGTH = 1_000_000  # 1MB character limit
+MAX_DIMENSION_NAME_LENGTH = 50
+MAX_DIMENSION_VALUE_LENGTH = 100
+
+# Query constants
+DEFAULT_QUERY_LIMIT = 50
+FULL_DETAIL_THRESHOLD = 5
+
+# Display constants
+ID_DISPLAY_LENGTH = 8
+
+# Typo detection
+TYPO_SIMILARITY_CUTOFF = 0.6
+
+DEFAULT_SCHEMA = {
+    "version": CURRENT_SCHEMA_VERSION,
+    "dimensions": {
+        "topic": "Project-specific subject areas",
+        "phase": "Workflow stage or document type"
+    },
+    "values": {
+        "topic": [],
+        "phase": [
+            "requirements",
+            "decision",
+            "planning",
+            "backend-implementation",
+            "frontend-implementation",
+            "testing",
+            "documentation",
+            "troubleshooting",
+            "deployment"
+        ]
+    }
+}
+
+
+# Helper Functions
+
+def get_membase_paths() -> Tuple[Path, Path, Path]:
+    """Get paths to membase directory and files."""
+    base = Path.cwd() / MEMBASE_DIR
+    schema = base / SCHEMA_FILE
+    memories = base / MEMORIES_FILE
+    return base, schema, memories
+
+
+def check_membase_exists() -> None:
+    """Check if membase is initialized, exit if not."""
+    base, _, _ = get_membase_paths()
+    if not base.exists():
+        error("Not a membase project. Run 'mb init' first.")
+        sys.exit(1)
+
+
+def acquire_file_lock(file_handle, exclusive: bool = False) -> None:
+    """
+    Acquire file lock for safe concurrent access.
+
+    Args:
+        file_handle: Open file handle
+        exclusive: True for exclusive (write) lock, False for shared (read) lock
+    """
+    try:
+        lock_type = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(file_handle.fileno(), lock_type)
+    except IOError as e:
+        error(f"Failed to acquire file lock: {e}")
+        sys.exit(1)
+
+
+def release_file_lock(file_handle) -> None:
+    """Release file lock."""
+    try:
+        fcntl.flock(file_handle.fileno(), fcntl.LOCK_UN)
+    except IOError:
+        pass  # Best effort
+
+
+def atomic_write(path: Path, content: str) -> None:
+    """
+    Write file atomically using temp file + rename, with fsync for durability.
+
+    Args:
+        path: Target file path
+        content: Content to write
+
+    Raises:
+        IOError: If write fails
+        OSError: If rename fails
+    """
+    temp_path = path.with_suffix('.tmp')
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())  # Force kernel to flush to disk
+        temp_path.replace(path)
+    except (IOError, OSError) as e:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise e
+
+
+def load_schema() -> Dict[str, Any]:
+    """
+    Load and validate schema from file.
+
+    Returns:
+        Schema dictionary
+
+    Raises:
+        SystemExit: If schema file not found, invalid JSON, or unsupported version
+    """
+    _, schema_path, _ = get_membase_paths()
+    try:
+        with open(schema_path, 'r', encoding='utf-8') as f:
+            acquire_file_lock(f, exclusive=False)
+            try:
+                schema = json.load(f)
+            finally:
+                release_file_lock(f)
+
+        # Check schema version
+        version = schema.get("version", 1)
+        if version > CURRENT_SCHEMA_VERSION:
+            error(f"Schema version {version} not supported by this membase version. Please upgrade.")
+            sys.exit(1)
+
+        # Migrate old schema if needed
+        if "version" not in schema:
+            schema["version"] = 1
+
+        return schema
+    except FileNotFoundError:
+        error("Schema file not found. Run 'mb init' first.")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        error(f"Invalid JSON in schema file: {e}")
+        sys.exit(1)
+    except IOError as e:
+        error(f"Failed to load schema: {e}")
+        sys.exit(1)
+
+
+def save_schema(schema: Dict[str, Any]) -> None:
+    """
+    Save schema to file with sorted values atomically.
+
+    Args:
+        schema: Schema dictionary to save
+
+    Raises:
+        SystemExit: If save fails
+    """
+    _, schema_path, _ = get_membase_paths()
+
+    # Sort dimension values alphabetically
+    for dim in schema["values"]:
+        schema["values"][dim] = sorted(schema["values"][dim])
+
+    # Write atomically
+    try:
+        content = json.dumps(schema, indent=2, ensure_ascii=False) + '\n'
+        atomic_write(schema_path, content)
+    except (IOError, OSError) as e:
+        error(f"Failed to save schema: {e}")
+        sys.exit(1)
+
+
+def validate_memory_structure(memory: Any, line_num: int) -> None:
+    """
+    Validate memory data structure.
+
+    Args:
+        memory: Memory object to validate
+        line_num: Line number in file (for error messages)
+
+    Raises:
+        SystemExit: If structure is invalid
+    """
+    if not isinstance(memory, dict):
+        error(f"Line {line_num}: Memory must be a JSON object, not {type(memory).__name__}")
+        sys.exit(1)
+
+    required = ["id", "summary", "content", "tags", "created_at"]
+    for field in required:
+        if field not in memory:
+            error(f"Line {line_num}: Missing required field '{field}'")
+            sys.exit(1)
+
+    if not isinstance(memory["tags"], dict):
+        error(f"Line {line_num}: Field 'tags' must be an object")
+        sys.exit(1)
+
+    # Validate UUID format
+    try:
+        uuid.UUID(memory["id"])
+    except ValueError:
+        error(f"Line {line_num}: Invalid UUID in 'id' field: {memory['id']}")
+        sys.exit(1)
+
+    # Validate types
+    if not isinstance(memory["summary"], str):
+        error(f"Line {line_num}: Field 'summary' must be a string")
+        sys.exit(1)
+
+    if not isinstance(memory["content"], str):
+        error(f"Line {line_num}: Field 'content' must be a string")
+        sys.exit(1)
+
+
+def load_memories() -> List[Dict[str, Any]]:
+    """
+    Load and validate all memories from file.
+
+    Returns:
+        List of memory dictionaries
+
+    Raises:
+        SystemExit: If file read fails or validation fails
+    """
+    _, _, memories_path = get_membase_paths()
+
+    if not memories_path.exists():
+        return []
+
+    memories = []
+    try:
+        with open(memories_path, 'r', encoding='utf-8') as f:
+            acquire_file_lock(f, exclusive=False)
+            try:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        memory = json.loads(line)
+                        validate_memory_structure(memory, line_num)
+                        memories.append(memory)
+                    except json.JSONDecodeError as e:
+                        error(f"Invalid JSON on line {line_num}: {e}")
+                        sys.exit(1)
+            finally:
+                release_file_lock(f)
+    except IOError as e:
+        error(f"Failed to load memories: {e}")
+        sys.exit(1)
+
+    return memories
+
+
+def save_memories(memories: List[Dict[str, Any]]) -> None:
+    """
+    Save memories to file atomically, sorted by UUID.
+
+    Args:
+        memories: List of memory dictionaries to save
+
+    Raises:
+        SystemExit: If save fails
+    """
+    _, _, memories_path = get_membase_paths()
+
+    # Sort by UUID
+    memories.sort(key=lambda m: m["id"])
+
+    # Build content
+    lines = []
+    for memory in memories:
+        lines.append(json.dumps(memory, separators=(',', ':'), ensure_ascii=False))
+    content = '\n'.join(lines) + '\n' if lines else ''
+
+    # Write atomically
+    try:
+        atomic_write(memories_path, content)
+    except (IOError, OSError) as e:
+        error(f"Failed to save memories: {e}")
+        sys.exit(1)
+
+
+def validate_identifier(name: str, max_length: int, field_name: str) -> None:
+    """
+    Validate dimension/value name is a safe identifier.
+
+    Args:
+        name: Name to validate
+        max_length: Maximum allowed length
+        field_name: Field name for error messages
+
+    Raises:
+        SystemExit: If validation fails
+    """
+    if not name or not name.strip():
+        error(f"{field_name} cannot be empty")
+        sys.exit(1)
+
+    if len(name) > max_length:
+        error(f"{field_name} too long ({len(name)} chars, max {max_length})")
+        sys.exit(1)
+
+    if not re.match(r'^[a-z0-9-]+$', name):
+        error(f"{field_name} '{name}' is invalid. Use only lowercase letters, numbers, and hyphens")
+        sys.exit(1)
+
+
+def validate_summary(summary: str) -> None:
+    """
+    Validate summary text.
+
+    Args:
+        summary: Summary to validate
+
+    Raises:
+        SystemExit: If validation fails
+    """
+    if not summary or not summary.strip():
+        error("Summary cannot be empty")
+        sys.exit(1)
+
+    if len(summary) > MAX_SUMMARY_LENGTH:
+        error(f"Summary too long ({len(summary)} chars, max {MAX_SUMMARY_LENGTH})")
+        sys.exit(1)
+
+
+def validate_content(content: str) -> None:
+    """
+    Validate content text.
+
+    Args:
+        content: Content to validate
+
+    Raises:
+        SystemExit: If validation fails
+    """
+    if not content or not content.strip():
+        error("Content cannot be empty")
+        sys.exit(1)
+
+    if len(content) > MAX_CONTENT_LENGTH:
+        error(f"Content too long ({len(content)} chars, max {MAX_CONTENT_LENGTH})")
+        sys.exit(1)
+
+
+def validate_tags(tags: Dict[str, str], schema: Dict[str, Any]) -> None:
+    """
+    Validate tags against schema.
+
+    Args:
+        tags: Tag dictionary to validate
+        schema: Schema to validate against
+
+    Raises:
+        SystemExit: If validation fails
+    """
+    if not tags:
+        error("At least one tag is required")
+        sys.exit(1)
+
+    dimensions = schema["dimensions"]
+    values = schema["values"]
+
+    for dim, val in tags.items():
+        # Check dimension exists
+        if dim not in dimensions:
+            suggestion = difflib.get_close_matches(dim, dimensions.keys(), n=1, cutoff=TYPO_SIMILARITY_CUTOFF)
+            if suggestion:
+                error(f"Unknown dimension '{dim}'. Did you mean: {suggestion[0]}?")
+            else:
+                error(f"Unknown dimension '{dim}'. Available: {', '.join(sorted(dimensions.keys()))}")
+            sys.exit(1)
+
+        # Check value exists
+        if val not in values[dim]:
+            suggestion = difflib.get_close_matches(val, values[dim], n=1, cutoff=TYPO_SIMILARITY_CUTOFF)
+            if suggestion:
+                error(f"Unknown value '{val}' for dimension '{dim}'. Did you mean: {suggestion[0]}?")
+            else:
+                available = ', '.join(sorted(values[dim])) if values[dim] else "(none defined)"
+                error(f"Unknown value '{val}' for dimension '{dim}'. Available: {available}")
+            sys.exit(1)
+
+
+def find_memory_by_id_prefix(memories: List[Dict[str, Any]], prefix: str) -> Dict[str, Any]:
+    """
+    Find memory by ID prefix, handle ambiguity.
+
+    Args:
+        memories: List of memories to search
+        prefix: ID prefix to match
+
+    Returns:
+        Matching memory
+
+    Raises:
+        SystemExit: If not found or ambiguous
+    """
+    matches = [m for m in memories if m["id"].startswith(prefix)]
+
+    if not matches:
+        error(f"Memory '{prefix}' not found")
+        sys.exit(1)
+
+    if len(matches) > 1:
+        ids = ', '.join([m["id"][:12] + '...' for m in matches])
+        error(f"Ambiguous ID '{prefix}', matches: {ids}")
+        sys.exit(1)
+
+    return matches[0]
+
+
+def now_iso() -> str:
+    """Get current timestamp in ISO 8601 format with timezone."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def success(msg: str) -> None:
+    """Print success message."""
+    print(f"✓ {msg}")
+
+
+def error(msg: str) -> None:
+    """Print error message to stderr."""
+    print(f"✗ {msg}", file=sys.stderr)
+
+
+def parse_tag_args(args: List[str]) -> Dict[str, str]:
+    """
+    Parse dimension=value arguments.
+
+    Args:
+        args: List of strings in format "dimension=value"
+
+    Returns:
+        Dictionary mapping dimension names to values
+
+    Raises:
+        SystemExit: If any argument is not in dimension=value format
+    """
+    tags = {}
+    for arg in args:
+        if '=' not in arg:
+            error(f"Invalid tag format '{arg}'. Use: dimension=value")
+            sys.exit(1)
+        dim, val = arg.split('=', 1)
+        tags[dim] = val
+    return tags
+
+
+# Command Implementations
+
+def cmd_init(args: argparse.Namespace) -> None:
+    """Initialize membase directory."""
+    base, schema_path, memories_path = get_membase_paths()
+
+    if base.exists():
+        error(f"Membase already initialized at {base}")
+        sys.exit(1)
+
+    # Create directory
+    base.mkdir(parents=True, exist_ok=True)
+
+    # Create schema
+    try:
+        content = json.dumps(DEFAULT_SCHEMA, indent=2, ensure_ascii=False) + '\n'
+        atomic_write(schema_path, content)
+    except (IOError, OSError) as e:
+        error(f"Failed to create schema: {e}")
+        sys.exit(1)
+
+    # Create empty memories file
+    try:
+        memories_path.touch()
+    except IOError as e:
+        error(f"Failed to create memories file: {e}")
+        sys.exit(1)
+
+    success(f"Initialized membase at {base}")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    """Add a new memory."""
+    check_membase_exists()
+
+    # Validate inputs
+    if not args.summary:
+        error("Summary is required (-s)")
+        sys.exit(1)
+
+    if not args.content:
+        error("Content is required (-c)")
+        sys.exit(1)
+
+    validate_summary(args.summary)
+    validate_content(args.content)
+
+    # Parse and validate tags
+    tags = parse_tag_args(args.tags)
+    schema = load_schema()
+    validate_tags(tags, schema)
+
+    # Create memory
+    memory = {
+        "id": str(uuid.uuid4()),
+        "summary": args.summary.strip(),
+        "content": args.content.strip(),
+        "tags": tags,
+        "created_at": now_iso()
+    }
+
+    # Save
+    memories = load_memories()
+    memories.append(memory)
+    save_memories(memories)
+
+    success(f"Added memory {memory['id'][:ID_DISPLAY_LENGTH]}")
+
+
+def cmd_query(args: argparse.Namespace) -> None:
+    """Query memories."""
+    check_membase_exists()
+
+    memories = load_memories()
+
+    # Filter by ID if specified
+    if args.id:
+        memory = find_memory_by_id_prefix(memories, args.id)
+        print_memory_full(memory)
+        return
+
+    # Parse tag filters
+    tag_filters = {}
+    if args.filters:
+        for filt in args.filters:
+            if '=' in filt:
+                dim, val = filt.split('=', 1)
+                tag_filters[dim] = val
+            elif filt.startswith('--'):
+                # Skip flags
+                continue
+            else:
+                error(f"Invalid filter '{filt}'. Use: --dimension value or dimension=value")
+                sys.exit(1)
+
+    # Handle --dimension value format
+    schema = load_schema()
+    for dim in schema["dimensions"]:
+        flag_name = f"--{dim}"
+        if hasattr(args, dim.replace('-', '_')) and getattr(args, dim.replace('-', '_')):
+            tag_filters[dim] = getattr(args, dim.replace('-', '_'))
+
+    # Apply filters
+    results = memories
+
+    # Tag filters (AND logic)
+    for dim, val in tag_filters.items():
+        results = [m for m in results if m.get("tags", {}).get(dim) == val]
+
+    # Search filter
+    if args.search:
+        search_lower = args.search.lower()
+        results = [
+            m for m in results
+            if search_lower in m["summary"].lower() or search_lower in m["content"].lower()
+        ]
+
+    # Apply limit
+    limit = args.limit if args.limit else DEFAULT_QUERY_LIMIT
+    total_results = len(results)
+    results = results[:limit]
+
+    # Output format
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return
+
+    if not results:
+        print("No memories found")
+        return
+
+    # Adaptive detail level
+    show_full = args.full or (not args.brief and len(results) <= FULL_DETAIL_THRESHOLD)
+
+    if show_full:
+        for i, memory in enumerate(results):
+            if i > 0:
+                print()
+            print_memory_full(memory)
+    else:
+        for memory in results:
+            print_memory_brief(memory)
+
+        print()
+        suffix = f" (showing {len(results)} of {total_results})" if len(results) < total_results else ""
+        print(f"({len(results)} memories{suffix}. Use --full for details or --id <uuid> for one.)")
+
+
+def print_memory_brief(memory: Dict[str, Any]) -> None:
+    """Print memory in brief format."""
+    id_short = memory["id"][:ID_DISPLAY_LENGTH]
+    tags_str = ' '.join([f"{k}={v}" for k, v in memory.get("tags", {}).items()])
+    print(f"{id_short} [{tags_str}]")
+    print(f"    {memory['summary']}")
+
+
+def print_memory_full(memory: Dict[str, Any]) -> None:
+    """Print memory in full format."""
+    id_short = memory["id"][:ID_DISPLAY_LENGTH]
+    tags_str = ' '.join([f"{k}={v}" for k, v in memory.get("tags", {}).items()])
+
+    print(f"─── {id_short} ───")
+    print(f"[{tags_str}]")
+    print(f"Summary: {memory['summary']}")
+    print()
+    print(memory["content"])
+    print()
+    print(f"Created: {memory['created_at']}")
+    if "updated_at" in memory:
+        print(f"Updated: {memory['updated_at']}")
+
+
+def cmd_dims(args: argparse.Namespace) -> None:
+    """Manage dimensions."""
+    check_membase_exists()
+    schema = load_schema()
+
+    # Add value to existing dimension
+    if args.dims_action == 'add':
+        dim = args.dimension
+        val = args.value
+
+        validate_identifier(val, MAX_DIMENSION_VALUE_LENGTH, "Dimension value")
+
+        if dim not in schema["dimensions"]:
+            error(f"Dimension '{dim}' does not exist")
+            sys.exit(1)
+
+        if val in schema["values"][dim]:
+            error(f"Value '{val}' already exists in dimension '{dim}'")
+            sys.exit(1)
+
+        schema["values"][dim].append(val)
+        save_schema(schema)
+        success(f"Added value '{val}' to dimension '{dim}'")
+        return
+
+    # Add new dimension
+    if args.dims_action == 'add-dim':
+        name = args.name
+        description = args.description or f"Custom dimension: {name}"
+
+        validate_identifier(name, MAX_DIMENSION_NAME_LENGTH, "Dimension name")
+
+        if name in schema["dimensions"]:
+            error(f"Dimension '{name}' already exists")
+            sys.exit(1)
+
+        schema["dimensions"][name] = description
+        schema["values"][name] = []
+        save_schema(schema)
+        success(f"Added dimension '{name}'")
+        return
+
+    # List dimensions (no action specified)
+    print("Dimensions:")
+    print()
+    for dim, desc in sorted(schema["dimensions"].items()):
+        print(f"{dim}:")
+        print(f"  {desc}")
+        values = schema["values"].get(dim, [])
+        if values:
+            for val in values:
+                print(f"  - {val}")
+        else:
+            print("  (no values defined)")
+        print()
+
+
+def cmd_edit(args: argparse.Namespace) -> None:
+    """Edit an existing memory."""
+    check_membase_exists()
+
+    memories = load_memories()
+    memory = find_memory_by_id_prefix(memories, args.id)
+
+    changed = False
+
+    # Update fields
+    if args.summary:
+        validate_summary(args.summary)
+        memory["summary"] = args.summary.strip()
+        changed = True
+
+    if args.content:
+        validate_content(args.content)
+        memory["content"] = args.content.strip()
+        changed = True
+
+    # Update tags
+    if args.tags:
+        new_tags = parse_tag_args(args.tags)
+        schema = load_schema()
+
+        # Merge with existing tags
+        memory["tags"].update(new_tags)
+        validate_tags(memory["tags"], schema)
+        changed = True
+
+    # Set updated_at only if changes were made
+    if changed:
+        memory["updated_at"] = now_iso()
+
+        # Save
+        save_memories(memories)
+        success(f"Updated memory {memory['id'][:ID_DISPLAY_LENGTH]}")
+    else:
+        print(f"No changes made to memory {memory['id'][:ID_DISPLAY_LENGTH]}")
+
+
+def cmd_delete(args: argparse.Namespace) -> None:
+    """Delete a memory."""
+    check_membase_exists()
+
+    memories = load_memories()
+    memory = find_memory_by_id_prefix(memories, args.id)
+
+    # Confirm deletion
+    if not args.yes:
+        # Check if running in interactive mode
+        if not sys.stdin.isatty():
+            error("Cannot prompt for confirmation in non-interactive mode. Use -y flag.")
+            sys.exit(1)
+
+        print_memory_brief(memory)
+        print()
+        try:
+            response = input("Delete this memory? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled")
+            return
+
+        if response not in ('y', 'yes'):
+            print("Cancelled")
+            return
+
+    # Remove and save
+    memories = [m for m in memories if m["id"] != memory["id"]]
+    save_memories(memories)
+    success(f"Deleted memory {memory['id'][:ID_DISPLAY_LENGTH]}")
+
+
+def cmd_stats(args: argparse.Namespace) -> None:
+    """Show statistics."""
+    check_membase_exists()
+
+    memories = load_memories()
+    schema = load_schema()
+
+    print(f"Total memories: {len(memories)}")
+    print()
+
+    # Count by dimension
+    for dim in sorted(schema["dimensions"].keys()):
+        print(f"{dim}:")
+        counts = {}
+        for memory in memories:
+            val = memory.get("tags", {}).get(dim)
+            if val:
+                counts[val] = counts.get(val, 0) + 1
+            else:
+                counts["(untagged)"] = counts.get("(untagged)", 0) + 1
+
+        if counts:
+            for val, count in sorted(counts.items()):
+                print(f"  {val}: {count}")
+        else:
+            print("  (no memories)")
+        print()
+
+
+# CLI Setup
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Membase - Git-native project memory system",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('--version', action='version', version=f'membase {VERSION}')
+
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # init
+    subparsers.add_parser('init', help='Initialize membase directory')
+
+    # add
+    add_parser = subparsers.add_parser('add', help='Add a memory')
+    add_parser.add_argument('-s', '--summary', help='Summary (max 100 chars)')
+    add_parser.add_argument('-c', '--content', help='Full content')
+    add_parser.add_argument('tags', nargs='+', help='Tags as dimension=value')
+
+    # query
+    query_parser = subparsers.add_parser('query', help='Query memories')
+    query_parser.add_argument('filters', nargs='*', help='Filters as dimension=value')
+    query_parser.add_argument('--id', help='Query by ID or prefix')
+    query_parser.add_argument('--search', help='Full-text search')
+    query_parser.add_argument('--all', action='store_true', help='List all memories')
+    query_parser.add_argument('--json', action='store_true', help='Output as JSON')
+    query_parser.add_argument('--full', action='store_true', help='Force detailed view')
+    query_parser.add_argument('--brief', action='store_true', help='Force summary view')
+    query_parser.add_argument('--limit', type=int, help='Limit results (default: 50)')
+
+    # Add dynamic dimension filters
+    query_parser.add_argument('--topic', help='Filter by topic')
+    query_parser.add_argument('--phase', help='Filter by phase')
+
+    # dims
+    dims_parser = subparsers.add_parser('dims', help='Manage dimensions')
+    dims_subparsers = dims_parser.add_subparsers(dest='dims_action', help='Dimension actions')
+
+    # dims add <dimension> <value>
+    dims_add_parser = dims_subparsers.add_parser('add', help='Add value to dimension')
+    dims_add_parser.add_argument('dimension', help='Dimension name')
+    dims_add_parser.add_argument('value', help='Value to add')
+
+    # dims add-dim <name> [description]
+    dims_add_dim_parser = dims_subparsers.add_parser('add-dim', help='Add new dimension')
+    dims_add_dim_parser.add_argument('name', help='Dimension name')
+    dims_add_dim_parser.add_argument('description', nargs='?', help='Dimension description')
+
+    # edit
+    edit_parser = subparsers.add_parser('edit', help='Edit a memory')
+    edit_parser.add_argument('id', help='Memory ID or prefix')
+    edit_parser.add_argument('-s', '--summary', help='New summary')
+    edit_parser.add_argument('-c', '--content', help='New content')
+    edit_parser.add_argument('tags', nargs='*', help='Tags to update as dimension=value')
+
+    # delete
+    delete_parser = subparsers.add_parser('delete', help='Delete a memory')
+    delete_parser.add_argument('id', help='Memory ID or prefix')
+    delete_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation')
+
+    # stats
+    subparsers.add_parser('stats', help='Show statistics')
+
+    # Parse and dispatch
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    # Dispatch
+    commands = {
+        'init': cmd_init,
+        'add': cmd_add,
+        'query': cmd_query,
+        'dims': cmd_dims,
+        'edit': cmd_edit,
+        'delete': cmd_delete,
+        'stats': cmd_stats
+    }
+
+    commands[args.command](args)
+
+
+if __name__ == '__main__':
+    main()
